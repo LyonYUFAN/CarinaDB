@@ -68,7 +68,7 @@ public class WALBenchmarkTest {
                         // 序列化
                         ByteBuffer buffer = LogRecordCoder.encode(record);
                         // 事实：allocate 分配的内存大小刚好等于数据大小，可以直接 array() 零拷贝获取
-                        byte[] dataBytes = buffer.array();
+                        ByteBuffer dataBytes = LogRecordCoder.encode(record);
                         // 核心操作：追加到 WAL
                         wal.append(dataBytes);
                     }

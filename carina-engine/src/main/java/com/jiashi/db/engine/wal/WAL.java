@@ -47,7 +47,7 @@ public class WAL {
      * 对外暴露的高并发追加写入方法
      * @param data 要落盘的二进制日志记录
      */
-    public void append(byte[] data) {
+    public void append(ByteBuffer data) {
         WriteRequest request = new WriteRequest(data);
 
         // 1. 无脑入队：所有线程第一步都是将请求推入并发队列
@@ -97,7 +97,7 @@ public class WAL {
         // 1. 收割队列，收集当前批次的所有请求
         while ((req = queue.poll()) != null) {
             batch.add(req);
-            totalBytes += req.data.length;
+            totalBytes += req.data.limit();
             if (batch.size() >= MAX_BATCH_SIZE) {
                 break;
             }
