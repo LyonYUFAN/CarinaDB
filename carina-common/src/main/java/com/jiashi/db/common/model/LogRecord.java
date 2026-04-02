@@ -3,6 +3,7 @@ package com.jiashi.db.common.model;
 /**
  * 内存中的数据载体，不涉及底层字节逻辑
  */
+// TODO(MVP-Debt): 缺乏 MVCC 全局序列号 (Sequence Number)。
 public class LogRecord {
     private byte type;
     private byte[] key;

@@ -7,12 +7,18 @@ import com.jiashi.db.engine.wal.WAL;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.Iterator;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * LSM-Tree 核心内存组件：统一接管 WAL 日志与无锁跳表的写入时序
  */
-public class MemTable {
+public class MemTable implements Iterable<LogRecord> {
+    // TODO(MVP-Debt): 状态切换权越界。
+    // 当前由 MemTable 内部利用 CAS 自行维护 isImmutable 状态，这在引擎工程中属于职责倒置。
+    // 未来演进：移除此字段及相关的 CAS 逻辑。
+    // 内存写满的判断逻辑应上浮，由 CarinaEngine 的写入主链路 (Write Thread/Group Commit) 统一计算剩余空间。
+    // 并在写满时由 Engine 执行 Write Stall (写停顿) 和 Pointer Switch (指针切换)。
 
     private final Arena arena;
     private final OffHeapSkipList skipList;
@@ -36,6 +42,20 @@ public class MemTable {
 
         // 事实：设定 90% 为安全水位线
         this.memoryThreshold = (int) (capacity * 0.90);
+    }
+
+    /**
+     * 对外暴露有序数据流，专供 Flush 到 SSTable 使用
+     */
+    @Override
+    public Iterator<LogRecord> iterator() {
+        // 状态机防御事实：通常只允许对 Immutable 的 MemTable 进行迭代刷盘
+        if (!isImmutable.get()) {
+            throw new IllegalStateException("Cannot iterate a mutable MemTable. Flush is only allowed for Immutable MemTable.");
+        }
+
+        // 直接委托给底层跳表
+        return skipList.iterator();
     }
 
     /**

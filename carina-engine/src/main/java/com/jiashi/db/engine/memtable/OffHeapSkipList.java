@@ -4,12 +4,14 @@ import com.jiashi.db.common.model.LogRecord;
 import com.jiashi.db.common.model.LogRecordType;
 import sun.misc.Unsafe;
 import java.lang.reflect.Field;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * 工业级堆外无锁跳表：彻底零 GC，纯物理指针寻址
  */
-public class OffHeapSkipList {
+public class OffHeapSkipList implements Iterable<LogRecord> {
 
     // 事实：跳表的最大物理层高。LevelDB 默认是 12，RocksDB 默认是 16。
     // 我们采用 12，意味着头节点最多预留 12 个 int 的坑位。
@@ -39,6 +41,11 @@ public class OffHeapSkipList {
         // 我们构造一个空的 LogRecord 作为占位符
         LogRecord dummyRecord = new LogRecord((byte)0, new byte[0], new byte[0]);
         this.headOffset = NodeAccessor.allocateAndWriteNode(arena, dummyRecord, MAX_HEIGHT);
+    }
+
+    @Override
+    public Iterator<LogRecord> iterator() {
+        return new SkipListIterator();
     }
 
     /**
@@ -230,6 +237,55 @@ public class OffHeapSkipList {
         );
         // 复用put的无锁挂载逻辑，将墓碑插入跳表
         this.put(tombstone);
+    }
+
+    /**
+     * 事实体现：极轻量级的堆外内存游标
+     */
+    private class SkipListIterator implements Iterator<LogRecord> {
+        // 游标：指向当前准备读取的节点在 Arena 中的物理偏移量
+        private int currentOffset;
+
+        public SkipListIterator() {
+            // 初始化事实：从虚拟头节点 (Head) 获取 Level 0 的第一个真实节点的偏移量
+            // 假设你底层有类似 getForwardPointer(nodeOffset, level) 的方法
+            // 头节点的 offset 通常固定为 0 或某个初始值
+            this.currentOffset = getForwardPointer(getHeadOffset(), 0);
+        }
+
+        @Override
+        public boolean hasNext() {
+            // 事实：偏移量不为 0（或你定义的结束标记符），说明 Level 0 链表未结束
+            return currentOffset != 0;
+        }
+
+        @Override
+        public LogRecord next() {
+            if (!hasNext()) {
+                throw new NoSuchElementException("SkipList is fully traversed.");
+            }
+
+            // 1. 从 Arena 中读取当前 Offset 处的数据
+            // 假设你的节点在堆外的布局是：[Header/Pointers...] + [LogRecord 序列化字节]
+            // 这里你需要调用你现有的解码逻辑，从 currentOffset 提取出 LogRecord
+            LogRecord record = decodeRecordFromArena(currentOffset);
+
+            // 2. 游标推进：强制读取当前节点的 Level 0 指针，获取下一个物理偏移量
+            currentOffset = getForwardPointer(currentOffset, 0);
+
+            return record;
+        }
+    }
+
+    // --- 以下为你需要确保底层存在的物理操作占位符 ---
+    private int getHeadOffset() { return 0; /* 替换为你的真实 Head 偏移量 */ }
+    private int getForwardPointer(int nodeOffset, int level) {
+        // 事实：从物理内存 nodeOffset 处，解析出第 level 层的下一个节点指针
+        return 0;
+    }
+    private LogRecord decodeRecordFromArena(int offset) {
+        // 事实：根据偏移量，从 Arena 的 ByteBuffer 中提取出字节并反序列化
+        return null;
     }
 
 }
