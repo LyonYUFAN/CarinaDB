@@ -242,20 +242,23 @@ public class OffHeapSkipList implements Iterable<LogRecord> {
     /**
      * 事实体现：极轻量级的堆外内存游标
      */
+    /**
+     * 事实体现：极轻量级的堆外内存游标
+     * 物理法则：跳表的最底层 (Level 0) 就是一条包含了所有数据的有序单向链表。
+     * 我们只需要顺着 Level 0 的 next_offset 物理指针一路往下爬即可。
+     */
     private class SkipListIterator implements Iterator<LogRecord> {
-        // 游标：指向当前准备读取的节点在 Arena 中的物理偏移量
+        // 游标：指向当前准备读取的节点在 Arena 中的绝对物理偏移量
         private int currentOffset;
 
         public SkipListIterator() {
-            // 初始化事实：从虚拟头节点 (Head) 获取 Level 0 的第一个真实节点的偏移量
-            // 假设你底层有类似 getForwardPointer(nodeOffset, level) 的方法
-            // 头节点的 offset 通常固定为 0 或某个初始值
-            this.currentOffset = getForwardPointer(getHeadOffset(), 0);
+            // 初始化事实：从跳表的物理车头 (headOffset) 开始，获取它在最底层 (Level 0) 的下一个真实节点
+            this.currentOffset = NodeAccessor.getNextOffset(arena, headOffset, 0);
         }
 
         @Override
         public boolean hasNext() {
-            // 事实：偏移量不为 0（或你定义的结束标记符），说明 Level 0 链表未结束
+            // 物理事实：在我们的堆外内存设计中，0 代表 NULL (链表尽头)
             return currentOffset != 0;
         }
 
@@ -265,27 +268,24 @@ public class OffHeapSkipList implements Iterable<LogRecord> {
                 throw new NoSuchElementException("SkipList is fully traversed.");
             }
 
-            // 1. 从 Arena 中读取当前 Offset 处的数据
-            // 假设你的节点在堆外的布局是：[Header/Pointers...] + [LogRecord 序列化字节]
-            // 这里你需要调用你现有的解码逻辑，从 currentOffset 提取出 LogRecord
-            LogRecord record = decodeRecordFromArena(currentOffset);
+            // 1. 从堆外内存解析当前节点的数据
+            byte type = NodeAccessor.getType(arena, currentOffset);
+            byte[] key = NodeAccessor.getKey(arena, currentOffset);
 
-            // 2. 游标推进：强制读取当前节点的 Level 0 指针，获取下一个物理偏移量
-            currentOffset = getForwardPointer(currentOffset, 0);
+            // 计算 Value 的位置并提取
+            int valLen = NodeAccessor.getValueLength(arena, currentOffset);
+            byte[] value = new byte[valLen];
+            int height = NodeAccessor.getHeight(arena, currentOffset);
+            int valStartOffset = currentOffset + NodeAccessor.HEADER_SIZE + (height * 4) + key.length;
+            arena.getBytes(valStartOffset, value);
+
+            // 2. 组装成高层能理解的 LogRecord
+            LogRecord record = new LogRecord(type, key, value);
+
+            // 3. 游标推进：强制读取当前节点的 Level 0 指针，驶向下一个物理节点
+            currentOffset = NodeAccessor.getNextOffset(arena, currentOffset, 0);
 
             return record;
         }
     }
-
-    // --- 以下为你需要确保底层存在的物理操作占位符 ---
-    private int getHeadOffset() { return 0; /* 替换为你的真实 Head 偏移量 */ }
-    private int getForwardPointer(int nodeOffset, int level) {
-        // 事实：从物理内存 nodeOffset 处，解析出第 level 层的下一个节点指针
-        return 0;
-    }
-    private LogRecord decodeRecordFromArena(int offset) {
-        // 事实：根据偏移量，从 Arena 的 ByteBuffer 中提取出字节并反序列化
-        return null;
-    }
-
 }

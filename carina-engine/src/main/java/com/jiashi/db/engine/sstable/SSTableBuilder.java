@@ -1,5 +1,7 @@
 package com.jiashi.db.engine.sstable;
 
+import com.jiashi.db.common.filter.BloomFilter;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -10,93 +12,165 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * 将 MemTable 中的数据流式转换为磁盘上的 SSTable 文件
+ * 核心写链路：负责流式接收数据，生成 Data Block，并最终拼接元数据和 Footer 封盘
  */
 public class SSTableBuilder {
 
     private final FileChannel channel;
     private final BlockBuilder dataBlockBuilder;
 
-    // 修复点：使用 List 在内存中无限量暂存 Index 条目，彻底摆脱 4KB 限制
+    // ======== 宏观元数据收集器 ========
+    private final BloomFilter bloomFilter;
     private final List<IndexEntry> memIndex = new ArrayList<>();
+    private byte[] minKey = null;
+    private byte[] maxKey = null;
 
+    // 记录当前磁盘物理写入指针的绝对位置
     private long currentOffset = 0;
+    // 记录刚刚写入的最后一个 Key，用于给 Data Block 当界标
     private byte[] lastKey;
 
-    // 内部类暂存目录
+    // 目录项结构：存放某个 Data Block 的上界 Key 及其物理偏移量
     private static class IndexEntry {
-        byte[] key;
+        byte[] maxKey;
         long blockOffset;
-        IndexEntry(byte[] key, long blockOffset) {
-            this.key = key;
+
+        IndexEntry(byte[] maxKey, long blockOffset) {
+            this.maxKey = maxKey;
             this.blockOffset = blockOffset;
         }
     }
 
-    public SSTableBuilder(Path filePath) throws IOException {
+    /**
+     * @param expectedInsertions 预计写入的 Key 数量（从 MemTable 大小推算，用于精准初始化 BloomFilter）
+     */
+    public SSTableBuilder(Path filePath, int expectedInsertions) throws IOException {
         this.channel = FileChannel.open(filePath,
                 StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE);
         this.dataBlockBuilder = new BlockBuilder();
+
+        // 事实：设定 1% 的误判率，初始化工业级布隆过滤器
+        this.bloomFilter = new BloomFilter(expectedInsertions, 0.01);
     }
 
+    /**
+     * 流水线：接收 MemTable 传来的 KV
+     */
     public void add(byte[] key, byte[] value) throws IOException {
+        // 1. 极值收集：顺手牵羊记录 Min/Max Key
+        if (minKey == null) {
+            minKey = Arrays.copyOf(key, key.length); // 截获第一条，必然是最小的
+        }
+        // 由于是从跳表顺序送进来的，最后一条必然是最大的，所以不断覆盖即可
+        maxKey = Arrays.copyOf(key, key.length);
+
+        // 2. 特征打标：让保安记住这个 Key
+        bloomFilter.add(key);
+
+        // 3. 砌砖逻辑：如果小推车（BlockBuilder）装不下了，就触发一次刷盘
         if (!dataBlockBuilder.add(key, value)) {
             flushDataBlock();
+            // 刷盘清空后，别忘了把刚刚被拒收的这条数据重新塞进新的推车里
             dataBlockBuilder.add(key, value);
         }
+
+        // 暂存，用于 flushDataBlock 时作为上个块的 MaxKey
         this.lastKey = Arrays.copyOf(key, key.length);
     }
 
+    /**
+     * 砌砖落地：将 4KB 小推车里的数据真正写入磁盘
+     */
     private void flushDataBlock() throws IOException {
-        if (dataBlockBuilder.isEmpty()) {
-            return;
-        }
+        if (dataBlockBuilder.isEmpty()) return;
 
         ByteBuffer dataBuffer = dataBlockBuilder.finish();
 
-        // 【核心修复】将最大的 Key 和当前的物理 Offset 记录到内存列表中，永不丢失
+        // 极其重要：在落盘前，把这块砖的绝对坐标和它的 MaxKey 记录到内存目录里
         memIndex.add(new IndexEntry(lastKey, currentOffset));
 
+        // 发生真实磁盘 I/O
         int written = 0;
         while (dataBuffer.hasRemaining()) {
             written += channel.write(dataBuffer);
         }
 
+        // 物理指针向前推进
         currentOffset += written;
         dataBlockBuilder.reset();
     }
 
+    /**
+     * 终极结账：封盘打钢印
+     */
     public void finish() throws IOException {
+        // 1. 先把推车里最后剩下的一点半成品数据刷入磁盘
         flushDataBlock();
 
-        long indexBlockOffset = currentOffset;
-
-        // 1. 精确计算百万级 Index Block 的总字节大小
-        int indexSize = 0;
-        for (IndexEntry entry : memIndex) {
-            indexSize += Integer.BYTES + entry.key.length + Integer.BYTES + Long.BYTES;
+        // ------------------------------------------------
+        // 阶段 1：写入 Bloom Filter Block
+        // ------------------------------------------------
+        long filterOffset = currentOffset; // 记录起点
+        byte[] filterBytes = bloomFilter.serialize();
+        ByteBuffer filterBuffer = ByteBuffer.wrap(filterBytes);
+        while (filterBuffer.hasRemaining()) {
+            currentOffset += channel.write(filterBuffer);
         }
 
-        // 2. 一次性分配足够大的堆外内存，将整个超级大目录拼装好
+        // ------------------------------------------------
+        // 阶段 2：写入 Index Block
+        // ------------------------------------------------
+        long indexBlockOffset = currentOffset; // 记录起点
+        // 计算 Index Block 总大小
+        int indexSize = 0;
+        for (IndexEntry entry : memIndex) {
+            indexSize += Integer.BYTES + entry.maxKey.length + Integer.BYTES + Long.BYTES;
+        }
+
         ByteBuffer indexBuffer = ByteBuffer.allocateDirect(indexSize);
         for (IndexEntry entry : memIndex) {
-            indexBuffer.putInt(entry.key.length);
-            indexBuffer.put(entry.key);
-            indexBuffer.putInt(8); // Offset 是 long 型，固定 8 字节
+            indexBuffer.putInt(entry.maxKey.length);
+            indexBuffer.put(entry.maxKey);
+            // 写入 Value 长度 (Offset 是 long，固定 8 字节) 和 具体的 Offset
+            indexBuffer.putInt(8);
             indexBuffer.putLong(entry.blockOffset);
         }
         indexBuffer.flip();
-
-        // 3. 一发入魂，写入磁盘
         while (indexBuffer.hasRemaining()) {
             currentOffset += channel.write(indexBuffer);
         }
 
-        long metaIndexOffset = 0;
-        Footer.writeFooter(channel, metaIndexOffset, indexBlockOffset);
+        // ------------------------------------------------
+        // 阶段 3：在尾部明文追加 MinKey 和 MaxKey
+        // ------------------------------------------------
+        long minKeyOffset = currentOffset;
+        writeKeyWithLength(minKey);
 
+        long maxKeyOffset = currentOffset;
+        writeKeyWithLength(maxKey);
+
+        // ------------------------------------------------
+        // 阶段 4：用我们刚刚写好的 Footer 打上 40 字节定长钢印
+        // ------------------------------------------------
+        Footer.writeFooter(channel, filterOffset, indexBlockOffset, minKeyOffset, maxKeyOffset);
+
+        // 物理事实：强制操作系统将页面缓存 (Page Cache) 刷入物理磁盘，防止掉电丢失
         channel.force(true);
         channel.close();
+    }
+
+    // 辅助序列化工具
+    private void writeKeyWithLength(byte[] key) throws IOException {
+        // 防止数据为空引发的空指针异常 (理论上不该发生)
+        if (key == null) key = new byte[0];
+
+        ByteBuffer buf = ByteBuffer.allocate(4 + key.length);
+        buf.putInt(key.length);
+        buf.put(key);
+        buf.flip();
+        while (buf.hasRemaining()) {
+            currentOffset += channel.write(buf);
+        }
     }
 }

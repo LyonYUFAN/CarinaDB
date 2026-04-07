@@ -163,4 +163,12 @@ public class MemTable implements Iterable<LogRecord> {
         // 注意：Arena 使用的是堆外直接内存，在 Java 中依赖 Cleaner 回收，
         // 或者在此处通过 Unsafe 手动调用 freeMemory 释放。V1 版本可先依赖系统回收。
     }
+
+    /**
+     * 暴露给上层引擎的强制冻结操作
+     * 事实：由 CarinaEngine 的写锁保证并发安全，此处直接 set 即可
+     */
+    public void freeze() {
+        isImmutable.set(true);
+    }
 }
