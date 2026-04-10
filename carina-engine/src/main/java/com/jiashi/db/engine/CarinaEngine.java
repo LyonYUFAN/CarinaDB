@@ -4,6 +4,7 @@ import com.jiashi.db.common.model.LogRecord;
 import com.jiashi.db.engine.memtable.MemTable;
 import com.jiashi.db.engine.sstable.SSTableBuilder;
 import com.jiashi.db.engine.sstable.SSTableReader;
+import com.jiashi.db.engine.wal.WAL;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -58,11 +59,33 @@ public class CarinaEngine {
         // 3. 初始化第一个活跃内存表
         this.activeMemTable = createNewMemTable();
 
+        recoverFromOldWals();
+
         System.out.println("CarinaDB 启动成功，已挂载 " + ssTables.size() + " 个 SSTable。");
     }
 
     /**
-     * 辅助工厂方法：分配具有独立 WAL 的新 MemTable
+     * 扫盘与加载极值地图
+     * @throws IOException
+     */
+    private void loadSSTables() throws IOException {
+        try (Stream<Path> paths = Files.list(Paths.get(dbDirectory))) {
+            List<Path> sstPaths = paths
+                    .filter(Files::isRegularFile)
+                    .filter(p -> p.toString().endsWith(".sst"))
+                    // 物理事实法则：文件号越大代表数据越新，降序排列
+                    .sorted(Comparator.comparing(Path::getFileName, Comparator.reverseOrder()))
+                    .collect(Collectors.toList());
+
+            for (Path sstPath : sstPaths) {
+                SSTableReader reader = new SSTableReader(sstPath);
+                ssTables.add(reader);
+            }
+        }
+    }
+
+    /**
+     * 分配具有独立 WAL 的新 MemTable
      */
     private MemTable createNewMemTable() throws IOException {
         // 利用时间戳或唯一序列号保证 WAL 文件名不冲突
@@ -164,9 +187,6 @@ public class CarinaEngine {
 
         // 3. 查冷热交替的磁盘极值地图 (SSTables)
         for (SSTableReader reader : ssTables) {
-            if (new String(key).equals("USER_00000000")) {
-                System.out.println("👉 [哨兵 1] 引擎开始查 SSTable: " + reader.getFileId() + ", 当前文件 Min=" + new String(reader.getMinKey()) + ", Max=" + new String(reader.getMaxKey()));
-            }
             // 利用极小常驻内存做 O(1) 拦截
             if (compareBytes(key, reader.getMinKey()) < 0 || compareBytes(key, reader.getMaxKey()) > 0) {
                 continue; // 范围不命中，绝对不碰磁盘
@@ -180,22 +200,6 @@ public class CarinaEngine {
         return null;
     }
 
-    private void loadSSTables() throws IOException {
-        try (Stream<Path> paths = Files.list(Paths.get(dbDirectory))) {
-            List<Path> sstPaths = paths
-                    .filter(Files::isRegularFile)
-                    .filter(p -> p.toString().endsWith(".sst"))
-                    // 物理事实法则：文件号越大代表数据越新，降序排列
-                    .sorted(Comparator.comparing(Path::getFileName, Comparator.reverseOrder()))
-                    .collect(Collectors.toList());
-
-            for (Path sstPath : sstPaths) {
-                SSTableReader reader = new SSTableReader(sstPath);
-                ssTables.add(reader);
-            }
-        }
-    }
-
     private int extractMaxFileId() {
         if (ssTables.isEmpty()) return 0;
         String fileName = ssTables.get(0).getFileId();
@@ -203,6 +207,34 @@ public class CarinaEngine {
             return Integer.parseInt(fileName.replace(".sst", ""));
         } catch (NumberFormatException e) {
             return 0;
+        }
+    }
+
+    private void recoverFromOldWals() throws IOException {
+        System.out.println("🚀 开始扫描并回放历史 WAL 日志...");
+        try(Stream<Path> paths = Files.list(Paths.get(dbDirectory))){
+            List<Path> walPaths = paths
+                    .filter(Files::isRegularFile)
+                    .filter(p -> p.toString().contains("wal_") && p.toString().endsWith(".log"))
+                    .sorted(Comparator.comparing(Path::getFileName))
+                    .collect(Collectors.toList());
+
+            if (walPaths.isEmpty()) {
+                System.out.println("✅ 没有发现遗留的 WAL 日志，无需恢复。");
+                return;
+            }
+
+            for (Path walPath : walPaths) {
+                String oldFileName = walPath.getFileName().toString();
+                if (oldFileName.equals(activeMemTable.getWalFileName())) {
+                    continue;
+                }
+                WAL wal = new WAL(dbDirectory,oldFileName);
+                wal.recover(record -> {
+                            activeMemTable.restoreFromWal(record);
+                    }
+                );
+            }
         }
     }
 

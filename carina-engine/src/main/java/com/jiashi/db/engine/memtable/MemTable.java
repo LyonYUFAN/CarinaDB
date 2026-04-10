@@ -23,6 +23,7 @@ public class MemTable implements Iterable<LogRecord> {
     private final Arena arena;
     private final OffHeapSkipList skipList;
     private final WAL wal;
+    private final String walFileName;
 
     // 物理阈值：通常设为 Arena 总容量的 90% 或 95%，预留缓冲空间防止最后一条大记录越界
     private final int memoryThreshold;
@@ -39,6 +40,7 @@ public class MemTable implements Iterable<LogRecord> {
         this.arena = new Arena(capacity);
         this.skipList = new OffHeapSkipList(this.arena);
         this.wal = new WAL(walDirectory, walFileName);
+        this.walFileName = walFileName;
 
         // 事实：设定 90% 为安全水位线
         this.memoryThreshold = (int) (capacity * 0.90);
@@ -138,14 +140,18 @@ public class MemTable implements Iterable<LogRecord> {
         return true;
     }
 
+    public String getWalFileName() {
+        return this.walFileName;
+    }
+
     /**
-     * 内部辅助：水位越线检测与状态翻转
+     * 用于引擎启动时的 WAL 宕机恢复。
+     * 不能在这个方法里调用 wal.append()，否则会导致日志双写灾难
      */
-    private void checkMemoryUsage() {
-        if (arena.memoryUsage() >= memoryThreshold) {
-            // 物理事实：利用 CAS 操作，确保在并发环境下，只会有 1 个线程成功执行翻转
-            isImmutable.compareAndSet(false, true);
-        }
+    public void restoreFromWal(LogRecord record) {
+        skipList.put(record);
+        // 2. 检查水位线，防备断电前遗留的数据量极大，直接把 MemTable 撑满了
+        checkMemoryUsage();
     }
 
     /**
@@ -153,6 +159,14 @@ public class MemTable implements Iterable<LogRecord> {
      */
     public boolean isImmutable() {
         return isImmutable.get();
+    }
+
+    /**
+     * 暴露给上层引擎的强制冻结操作
+     * 事实：由 CarinaEngine 的写锁保证并发安全，此处直接 set 即可
+     */
+    public void freeze() {
+        isImmutable.set(true);
     }
 
     /**
@@ -165,10 +179,12 @@ public class MemTable implements Iterable<LogRecord> {
     }
 
     /**
-     * 暴露给上层引擎的强制冻结操作
-     * 事实：由 CarinaEngine 的写锁保证并发安全，此处直接 set 即可
+     * 水位越线检测与状态翻转
      */
-    public void freeze() {
-        isImmutable.set(true);
+    private void checkMemoryUsage() {
+        if (arena.memoryUsage() >= memoryThreshold) {
+            // 物理事实：利用 CAS 操作，确保在并发环境下，只会有 1 个线程成功执行翻转
+            isImmutable.compareAndSet(false, true);
+        }
     }
 }

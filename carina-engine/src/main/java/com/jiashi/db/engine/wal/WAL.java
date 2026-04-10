@@ -115,7 +115,7 @@ public class WAL {
                 fileChannel.write(buffer);
             }
             // force(false) 告诉操作系统将文件内容（不强求元数据）强制刷入物理磁盘
-            //fileChannel.force(false);
+            fileChannel.force(false);
             // 4. 集体唤醒：遍历这批请求，点亮它们的 Future 凭证
             for (WriteRequest r : batch) {
                 r.future.complete(null);
