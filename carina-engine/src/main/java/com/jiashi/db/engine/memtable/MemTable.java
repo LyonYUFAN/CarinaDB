@@ -61,7 +61,7 @@ public class MemTable implements Iterable<LogRecord> {
     }
 
     /**
-     * 对外暴露的写入链路
+     * 核心写入链路
      * @return true 表示写入成功；false 表示 MemTable 已满（需要上层切换）
      */
     public boolean put(byte[] key, byte[] value) {
@@ -87,6 +87,32 @@ public class MemTable implements Iterable<LogRecord> {
         checkMemoryUsage();
 
         return true;
+    }
+
+    /**
+     * 核心写入链路 —— 支持向量版本
+     * @return true 表示写入成功；false 表示 MemTable 已满（需要上层切换）
+     */
+    public boolean put(byte[] key, byte[] value, float[] vector) {
+        // 检查状态
+        if(isImmutable.get()) {
+            return false;
+        }
+        LogRecord record = new LogRecord(LogRecordType.PUT_VECTOR, key, value, vector);
+        try {
+            // 优先落入 WAL
+            wal.append(LogRecordCoder.encode(record));
+
+            // 写入跳表
+            skipList.put(record);
+
+            // 检查水位线
+            checkMemoryUsage();
+            return true;
+        } catch (Exception e) {
+            System.err.println("MemTable 写入向量数据失败: " + e.getMessage());
+            return false;
+        }
     }
 
     /**

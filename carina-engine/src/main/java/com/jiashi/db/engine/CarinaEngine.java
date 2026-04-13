@@ -94,7 +94,7 @@ public class CarinaEngine {
     }
 
     /**
-     * 核心写链路 (Put)
+     * 核心写链路
      */
     public void put(byte[] key, byte[] value) throws IOException {
         // 1. 尝试写入当前 Active MemTable
@@ -105,6 +105,21 @@ public class CarinaEngine {
             switchMemTable();
             // 切换完成后，重试写入全新的 MemTable (不考虑单挑 KV 超过 64MB 的极端情况)
             activeMemTable.put(key, value);
+        }
+    }
+
+    /**
+     * 核心写链路 —— 带向量的高维数据写入
+     */
+    public void put(byte[] key, byte[] value, float[] vector) throws IOException {
+        // 先尝试写入当前 Active MemTable
+        boolean success = activeMemTable.put(key, value, vector);
+
+        // 如果物理水位已满，必须切换
+        if (!success) {
+            switchMemTable();
+            // 切换完成后，重试写入全新的 MemTable
+            activeMemTable.put(key, value, vector);
         }
     }
 

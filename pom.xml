@@ -12,6 +12,7 @@
         <module>carina-common</module>
         <module>carina-client</module>
         <module>carina-engine</module>
+        <module>carina-server</module>
     </modules>
 
     <properties>
