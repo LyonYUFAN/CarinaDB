@@ -3,6 +3,7 @@ package com.jiashi.db.engine.memtable;
 import com.jiashi.db.common.model.LogRecord;
 import com.jiashi.db.common.model.LogRecordType;
 import com.jiashi.db.common.coder.LogRecordCoder; // 假设你有这个编码器
+import com.jiashi.db.engine.blob.BlobWriter;
 import com.jiashi.db.engine.wal.WAL;
 
 import java.io.IOException;
@@ -47,6 +48,13 @@ public class MemTable implements Iterable<LogRecord> {
     }
 
     /**
+     * 不仅返回 Value，还要返回包含 Pointer 的完整记录
+     */
+    public LogRecord getRecord(byte[] key) {
+        return skipList.getRecord(key);
+    }
+
+    /**
      * 对外暴露有序数据流，专供 Flush 到 SSTable 使用
      */
     @Override
@@ -60,90 +68,20 @@ public class MemTable implements Iterable<LogRecord> {
         return skipList.iterator();
     }
 
-    /**
-     * 核心写入链路
-     * @return true 表示写入成功；false 表示 MemTable 已满（需要上层切换）
-     */
-    public boolean put(byte[] key, byte[] value) {
-        // 1. 状态机防御：如果已经冻结，直接拒绝写入
-        if (isImmutable.get()) {
+    public boolean put(byte type, byte[] key, byte[]value, byte[]pointerBytes){
+        if(isImmutable.get()){
             return false;
         }
-
-        // 构造逻辑载体
-        LogRecord record = new LogRecord(LogRecordType.PUT_KV, key, value);
-
-        // 2. 物理落盘链路 (严格前置)
-        // 事实：WAL 只能接收纯字节，必须先将 Record 序列化
-        ByteBuffer encodedData = LogRecordCoder.encode(record);
-
-        // 此处会进入组提交并发队列，阻塞直至强制物理落盘 (fsync)
-        wal.append(encodedData);
-
-        // 3. 内存索引挂载 (确保日志绝对安全后执行)
-        skipList.put(record);
-
-        // 4. 水位检测：每次写完检查物理游标是否越线
-        checkMemoryUsage();
-
-        return true;
-    }
-
-    /**
-     * 核心写入链路 —— 支持向量版本
-     * @return true 表示写入成功；false 表示 MemTable 已满（需要上层切换）
-     */
-    public boolean put(byte[] key, byte[] value, float[] vector) {
-        // 检查状态
-        if(isImmutable.get()) {
-            return false;
-        }
-        LogRecord record = new LogRecord(LogRecordType.PUT_VECTOR, key, value, vector);
-        try {
-            // 优先落入 WAL
+        LogRecord record = new LogRecord(type, key, value, pointerBytes);
+        try{
             wal.append(LogRecordCoder.encode(record));
-
-            // 写入跳表
             skipList.put(record);
-
-            // 检查水位线
             checkMemoryUsage();
             return true;
-        } catch (Exception e) {
-            System.err.println("MemTable 写入向量数据失败: " + e.getMessage());
+        }catch (Exception e){
+            System.err.println("MemTable 统一写入失败: " + e.getMessage());
             return false;
         }
-    }
-
-    /**
-     * 对外暴露的向量写入链路 (Vector 专属)
-     */
-    public boolean putVector(byte[] key, byte[] value, float[] vector) {
-        // 1. 状态机防御
-        if (isImmutable.get()) {
-            return false;
-        }
-
-        // 2. 物理事实：明确使用 PUT_VECTOR 类型，并挂载向量数组
-        LogRecord record = new LogRecord(LogRecordType.PUT_VECTOR, key, value, vector);
-
-        // 3. 严格遵循 WAL -> SkipList 的写入时序
-        ByteBuffer encodedData = LogRecordCoder.encode(record);
-        wal.append(encodedData);
-        skipList.put(record);
-
-        // 4. 水位检测
-        checkMemoryUsage();
-
-        return true;
-    }
-
-    /**
-     * 极速无锁读取链路
-     */
-    public byte[] get(byte[] key) {
-        // 事实：直接委托给底层的 O(log n) 物理寻路器
-        return skipList.get(key);
     }
 
     /**
@@ -155,7 +93,7 @@ public class MemTable implements Iterable<LogRecord> {
         }
 
         // 构造墓碑节点
-        LogRecord tombstone = new LogRecord(LogRecordType.DELETE, key, new byte[0]);
+        LogRecord tombstone = new LogRecord(LogRecordType.DELETE, key, new byte[0],null);
         ByteBuffer encodedData = LogRecordCoder.encode(tombstone);
 
         // 严格遵循 WAL -> SkipList 时序
@@ -164,6 +102,15 @@ public class MemTable implements Iterable<LogRecord> {
 
         checkMemoryUsage();
         return true;
+    }
+
+    /**
+     * 将 BlobWriter 的指挥权交给内部的 WAL
+     */
+    public void setBlobWriter(BlobWriter blobWriter) {
+        if (this.wal != null) {
+            this.wal.setBlobWriter(blobWriter);
+        }
     }
 
     public String getWalFileName() {

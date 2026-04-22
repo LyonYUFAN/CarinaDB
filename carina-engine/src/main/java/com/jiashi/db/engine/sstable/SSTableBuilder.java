@@ -55,27 +55,21 @@ public class SSTableBuilder {
     }
 
     /**
-     * 流水线：接收 MemTable 传来的 KV
+     * 接收 MemTable 或 Compactor 传来的数据
+     * @param type    物理类型 (PUT_KV, PUT_VECTOR, DELETE)
+     * @param pointer 20 字节藏宝图 (如果是纯 KV 或墓碑，传 null)
      */
-    public void add(byte[] key, byte[] value) throws IOException {
-        // 1. 极值收集：顺手牵羊记录 Min/Max Key
+    public void add(byte[] key, byte[] value, byte type, byte[] pointer) throws IOException {
         if (minKey == null) {
-            minKey = Arrays.copyOf(key, key.length); // 截获第一条，必然是最小的
+            minKey = Arrays.copyOf(key, key.length);
         }
-        // 由于是从跳表顺序送进来的，最后一条必然是最大的，所以不断覆盖即可
         maxKey = Arrays.copyOf(key, key.length);
-
-        // 2. 特征打标：让保安记住这个 Key
         bloomFilter.add(key);
-
-        // 3. 砌砖逻辑：如果小推车（BlockBuilder）装不下了，就触发一次刷盘
-        if (!dataBlockBuilder.add(key, value)) {
+        if(dataBlockBuilder.add(key,value,type,pointer))
+        {
             flushDataBlock();
-            // 刷盘清空后，别忘了把刚刚被拒收的这条数据重新塞进新的推车里
-            dataBlockBuilder.add(key, value);
+            dataBlockBuilder.add(key,value,type,pointer);
         }
-
-        // 暂存，用于 flushDataBlock 时作为上个块的 MaxKey
         this.lastKey = Arrays.copyOf(key, key.length);
     }
 

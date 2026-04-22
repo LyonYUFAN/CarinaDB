@@ -1,5 +1,7 @@
 package com.jiashi.db.engine.wal;
 
+import com.jiashi.db.engine.blob.BlobWriter;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -27,6 +29,8 @@ public class WAL {
 
     // 单次组提交的最大请求数量，防止一次性拼装的 ByteBuffer 过大导致 OOM
     private static final int MAX_BATCH_SIZE = 1000;
+
+    private volatile BlobWriter activeBlobWriter;
 
     /**
      * 构造函数：初始化 WAL 文件通道
@@ -114,6 +118,11 @@ public class WAL {
             while (buffer.hasRemaining()) {
                 fileChannel.write(buffer);
             }
+
+            if (activeBlobWriter != null) {
+                activeBlobWriter.sync();
+            }
+
             // force(false) 告诉操作系统将文件内容（不强求元数据）强制刷入物理磁盘
             fileChannel.force(false);
             // 4. 集体唤醒：遍历这批请求，点亮它们的 Future 凭证
@@ -126,6 +135,10 @@ public class WAL {
                 r.future.completeExceptionally(new RuntimeException("WAL Flush Failed", e));
             }
         }
+    }
+
+    public void setBlobWriter(com.jiashi.db.engine.blob.BlobWriter blobWriter) {
+        this.activeBlobWriter = blobWriter;
     }
 
     /**

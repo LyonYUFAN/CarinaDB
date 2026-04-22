@@ -39,7 +39,7 @@ public class OffHeapSkipList implements Iterable<LogRecord> {
         this.arena = arena;
         // 事实：在 Arena 创建之初，强制分配一个拥有最大层高的“哑节点”作为车头
         // 我们构造一个空的 LogRecord 作为占位符
-        LogRecord dummyRecord = new LogRecord((byte)0, new byte[0], new byte[0]);
+        LogRecord dummyRecord = new LogRecord((byte)0, new byte[0], new byte[0], null);
         this.headOffset = NodeAccessor.allocateAndWriteNode(arena, dummyRecord, MAX_HEIGHT);
     }
 
@@ -161,67 +161,42 @@ public class OffHeapSkipList implements Iterable<LogRecord> {
     }
 
     /**
-     * 字节数组的无符号字典序比对（数据库底层的通用比对方式）
-     * 返回值: < 0 (a < b), == 0 (a == b), > 0 (a > b)
+     * 无锁读取：返回包含pointLen的完整 LogRecord
      */
-    private int compareKeys(byte[] a, byte[] b) {
-        int minLength = Math.min(a.length, b.length);
-        for (int i = 0; i < minLength; i++) {
-            // 将 byte 转为无符号 int 进行比较，避免 Java 默认的有符号负数干扰
-            int aVal = a[i] & 0xFF;
-            int bVal = b[i] & 0xFF;
-            if (aVal != bVal) {
-                return aVal - bVal;
-            }
-        }
-        return a.length - b.length;
-    }
-
-    /**
-     * O(log n) 高速无锁读取：从最高层降维搜索
-     * @return 如果找到且不是墓碑，返回 Value 字节；否则返回 null
-     */
-    public byte[] get(byte[] targetKey) {
+    public LogRecord getRecord(byte[] targetKey) {
         int currentOffset = headOffset;
-
-        // 事实：从最高层的高速公路往下掉
-        for (int level = MAX_HEIGHT - 1; level >= 0; level--) {
+        for(int level = MAX_HEIGHT - 1; level >= 0; level--) {
             int nextOffset = NodeAccessor.getNextOffset(arena, currentOffset, level);
-
             while (nextOffset != 0) {
                 byte[] nextKey = NodeAccessor.getKey(arena, nextOffset);
-                int cmp = compareKeys(nextKey, targetKey);
-
+                int cmp  = compareKeys(nextKey, targetKey);
                 if (cmp < 0) {
-                    // nextKey < targetKey，说明目标在更右边，继续在当前层向右推进
                     currentOffset = nextOffset;
                     nextOffset = NodeAccessor.getNextOffset(arena, currentOffset, level);
-                } else if (cmp == 0) {
-                    // 物理事实：找到了完全匹配的 Key！
-
-                    // 检查类型，判断是否是“逻辑删除”的墓碑节点
+                }else if(cmp == 0){
                     byte type = NodeAccessor.getType(arena, nextOffset);
-                    if (type == LogRecordType.DELETE) {
-                        return null; // 数据已被逻辑删除
-                    }
-
-                    // 跨过 Header、Pointers 和 KeyBytes，读取真正的 Value
                     int valLen = NodeAccessor.getValueLength(arena, nextOffset);
                     byte[] value = new byte[valLen];
-
-                    // 绝对物理坐标计算：基址 + 固定Header(17) + 指针区 + Key长度
                     int height = NodeAccessor.getHeight(arena, nextOffset);
-                    int valStartOffset = nextOffset + NodeAccessor.HEADER_SIZE + (height * 4) + nextKey.length;
 
+                    int valStartOffset = nextOffset + NodeAccessor.HEADER_SIZE + (height * 4) + nextKey.length;
                     arena.getBytes(valStartOffset, value);
-                    return value;
-                } else {
-                    // nextKey > targetKey，说明这一层走过头了，停止水平推进，准备掉到下一层
+
+                    int pointerLen = NodeAccessor.getPointerLength(arena, nextOffset);
+                    byte[] pointerBytes = null;
+                    if (pointerLen > 0) {
+                        pointerBytes = new byte[pointerLen];
+                        // Pointer 的绝对物理坐标，就紧紧贴在 Value 的屁股后面！
+                        int pointerStartOffset = valStartOffset + valLen;
+                        arena.getBytes(pointerStartOffset, pointerBytes);
+                    }
+
+                    return new LogRecord(type, nextKey, value, pointerBytes);
+                }else{
                     break;
                 }
             }
         }
-        // 到底层都没找到
         return null;
     }
 
@@ -233,7 +208,8 @@ public class OffHeapSkipList implements Iterable<LogRecord> {
         LogRecord tombstone = new LogRecord(
                 LogRecordType.DELETE,
                 key,
-                new byte[0] // 释放 Value 空间，极度压缩物理内存占用
+                new byte[0], // 释放 Value 空间
+                null         // 释放 Pointer 空间
         );
         // 复用put的无锁挂载逻辑，将墓碑插入跳表
         this.put(tombstone);
@@ -279,13 +255,38 @@ public class OffHeapSkipList implements Iterable<LogRecord> {
             int valStartOffset = currentOffset + NodeAccessor.HEADER_SIZE + (height * 4) + key.length;
             arena.getBytes(valStartOffset, value);
 
+            int ptrLen = NodeAccessor.getPointerLength(arena, currentOffset);
+            byte[] pointer = null;
+            if (ptrLen > 0) {
+                pointer = new byte[ptrLen];
+                int ptrStartOffset = valStartOffset + valLen;
+                arena.getBytes(ptrStartOffset, pointer);
+            }
+
             // 2. 组装成高层能理解的 LogRecord
-            LogRecord record = new LogRecord(type, key, value);
+            LogRecord record = new LogRecord(type, key, value, pointer);
 
             // 3. 游标推进：强制读取当前节点的 Level 0 指针，驶向下一个物理节点
             currentOffset = NodeAccessor.getNextOffset(arena, currentOffset, 0);
 
             return record;
         }
+    }
+
+    /**
+     * 字节数组的无符号字典序比对（数据库底层的通用比对方式）
+     * 返回值: < 0 (a < b), == 0 (a == b), > 0 (a > b)
+     */
+    private int compareKeys(byte[] a, byte[] b) {
+        int minLength = Math.min(a.length, b.length);
+        for (int i = 0; i < minLength; i++) {
+            // 将 byte 转为无符号 int 进行比较，避免 Java 默认的有符号负数干扰
+            int aVal = a[i] & 0xFF;
+            int bVal = b[i] & 0xFF;
+            if (aVal != bVal) {
+                return aVal - bVal;
+            }
+        }
+        return a.length - b.length;
     }
 }

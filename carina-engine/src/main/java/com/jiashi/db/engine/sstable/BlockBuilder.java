@@ -1,10 +1,11 @@
 package com.jiashi.db.engine.sstable;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 
 /**
  * 负责在内存中构建4KB的数据块
- * 既可以用来构建Data Block，也可以用来构建Index Block
+ * 既可以用来构建 Data Block，也可以用来构建 Index Block
  */
 public class BlockBuilder {
     // 默认块大小 4KB
@@ -18,34 +19,26 @@ public class BlockBuilder {
     }
 
     /**
-     * 尝试将KV写入当前块。
-     * 物理结构: Key_Length(4) + Key + Value_Length(4) + Value
-     * * @return 如果当前块满了，返回 false，提示上层需要刷盘了；写入成功返回 true
+     * 核心写块链路
+     * @return true 写入成功；false 表示当前 4KB 块已满，需要上层换新块
      */
-    public boolean add(byte[] key, byte[] value) {
-        // 计算这条记录需要的物理空间
-        int requiredSpace = Integer.BYTES * 2 + key.length + value.length;
+    public boolean add(byte[] key, byte[] value, byte type, byte[] pointer) throws IOException {
+        int keyLen = key !=null ? key.length : 0;
+        int valLen = value != null ? value.length : 0;
+        int ptrLen = pointer !=null ? pointer.length : 0;
 
-        // 判断是否超过 4KB 边界 (这里允许最后一条记录轻微溢出，为了简化设计)
-        if (buffer.position() > 0 && buffer.position() + requiredSpace > buffer.capacity()) {
-            // 当前块已满，不能再加了
+        int requiredSpace = 13 + keyLen + valLen + ptrLen;
+        if (buffer.remaining() < requiredSpace) {
             return false;
         }
+        buffer.put(type);
+        buffer.putInt(keyLen);
+        buffer.putInt(valLen);
+        buffer.putInt(ptrLen);
 
-        // 如果容量不够但这是块里的第一条记录，我们需要扩容 (防止单条 KV 本身就大于 4KB)
-        if (buffer.capacity() - buffer.position() < requiredSpace) {
-            ByteBuffer newBuffer = ByteBuffer.allocateDirect(buffer.position() + requiredSpace);
-            buffer.flip();
-            newBuffer.put(buffer);
-            this.buffer = newBuffer;
-        }
-
-        // 写入字节流
-        buffer.putInt(key.length);
-        buffer.put(key);
-        buffer.putInt(value.length);
-        buffer.put(value);
-
+        if (keyLen > 0) buffer.put(key);
+        if (valLen > 0) buffer.put(value);
+        if (ptrLen > 0) buffer.put(pointer);
         return true;
     }
 

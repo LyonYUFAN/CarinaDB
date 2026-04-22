@@ -1,6 +1,7 @@
 package com.jiashi.db.engine.sstable;
 
 import com.jiashi.db.common.filter.BloomFilter;
+import com.jiashi.db.common.model.LogRecord;
 import com.jiashi.db.engine.cache.BlockCache;
 
 import java.io.IOException;
@@ -88,73 +89,56 @@ public class SSTableReader {
     public String getFileId() { return fileId; }
 
     /**
-     * 核心点查方法：层层通关的 Lazy Loading 链路
+     * WiscKey 分离读取
      */
-    public byte[] searchBinary(byte[] targetKey) throws IOException {
-
+    public LogRecord searchBinaryFullRecord(byte[] targetKey) throws IOException {
         BloomFilter filter = getBloomFilterLazy();
-        if (!filter.mightContain(targetKey)) {
-            return null;
-        }
-
-        // ==========================================
-        // 防线 2：按需获取 Index Block 并二分查找定位数据块
-        // ==========================================
+        if (!filter.mightContain(targetKey)) return null;
         List<IndexEntry> indexEntries = getIndexBlockLazy();
-
         long targetBlockOffset = -1;
         long nextBlockOffset = -1;
-        int low = 0;
-        int high = indexEntries.size() - 1;
-
+        int low = 0, high = indexEntries.size() - 1;
         while (low <= high) {
             int mid = (low + high) >>> 1;
-
             IndexEntry midEntry = indexEntries.get(mid);
             int cmp = compareBytes(targetKey, midEntry.maxKey);
             if (cmp == 0) {
                 targetBlockOffset = midEntry.blockOffset;
-                // 记录下一块的起点，用于推算当前块的精确大小
-                if (mid + 1 < indexEntries.size()) {
-                    nextBlockOffset = indexEntries.get(mid + 1).blockOffset;
-                }
+                if (mid + 1 < indexEntries.size()) nextBlockOffset = indexEntries.get(mid + 1).blockOffset;
                 break;
             } else if (cmp < 0) {
                 targetBlockOffset = midEntry.blockOffset;
-                if (mid + 1 < indexEntries.size()) {
-                    nextBlockOffset = indexEntries.get(mid + 1).blockOffset;
-                }
+                if (mid + 1 < indexEntries.size()) nextBlockOffset = indexEntries.get(mid + 1).blockOffset;
                 high = mid - 1;
             } else {
                 low = mid + 1;
             }
         }
-        if (targetBlockOffset == -1) {
-            return null; // 连目录都没匹配上，说明发生了布隆过滤器的假阳性
-        }
+            if (targetBlockOffset == -1) return null;
+            byte[] dataBlock = getDataBlockLazy(targetBlockOffset, nextBlockOffset);
+            ByteBuffer blockReader = ByteBuffer.wrap(dataBlock);
+            while(blockReader.hasRemaining()){
+                byte type = blockReader.get();
+                int keyLen = blockReader.getInt();
+                if (keyLen <= 0) break;
+                int valLen = blockReader.getInt();
+                int pointerLen = blockReader.getInt();
+                byte[] currentKey = new byte[keyLen];
+                blockReader.get(currentKey);
 
-        // ==========================================
-        // 防线 3：按需抽取目标 Data Block，并在内存中精确比对
-        // ==========================================
-        byte[] dataBlock = getDataBlockLazy(targetBlockOffset, nextBlockOffset);
+                byte[] currentValue = new byte[valLen];
+                blockReader.get(currentValue);
 
-        ByteBuffer blockReader = ByteBuffer.wrap(dataBlock);
-        while (blockReader.hasRemaining()) {
-
-            int keyLen = blockReader.getInt();
-            if (keyLen <= 0) break;
-            byte[] currentKey = new byte[keyLen];
-            blockReader.get(currentKey);
-
-            int valLen = blockReader.getInt();
-            byte[] currentValue = new byte[valLen];
-            blockReader.get(currentValue);
-
-            if (Arrays.equals(targetKey, currentKey)) {
-                return currentValue;
+                byte[] currentPointer = null;
+                if (pointerLen > 0) {
+                    currentPointer = new byte[pointerLen];
+                    blockReader.get(currentPointer);
+                }
+                if (Arrays.equals(targetKey, currentKey)) {
+                    return new LogRecord(type, currentKey, currentValue, currentPointer);
+                }
             }
-        }
-        return null;
+            return null;
     }
 
     // ------------------------------------------------------------------------

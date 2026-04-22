@@ -3,11 +3,11 @@ package com.jiashi.db.engine.memtable;
 import com.jiashi.db.common.model.LogRecord;
 
 /**
- * 堆外跳表节点的物理寻址器 (纯静态工具类，彻底消灭 GC)
- * * 优化后的物理内存布局事实 (O(1) 指针寻址)：
- * [Type(1B)] [KeyLen(4B)] [ValLen(4B)] [VecLen(4B)] [Height(4B)]  <-- 固定 Header 区 (17B)
- * [NextPointers(Height * 4B)]                                     <-- 指针区 (紧随 Header，绝对零损耗定位)
- * [KeyBytes(变长)] [ValBytes(变长)] [VecBytes(变长)]                  <-- 数据区
+ * 堆外跳表节点的物理寻址器
+ * 物理内存布局事实：
+ * [Type(1B)] [KeyLen(4B)] [ValLen(4B)] [PointerLen(4B)] [Height(4B)]  <-- 固定 Header 区 (17B)
+ * [NextPointers(Height * 4B)]                                         <-- 指针区 (紧随 Header)
+ * [KeyBytes] [ValBytes] [PointerBytes]                                <-- 数据区
  */
 public final class NodeAccessor {
 
@@ -17,24 +17,22 @@ public final class NodeAccessor {
     private static final int TYPE_OFFSET = 0;
     private static final int KEY_LEN_OFFSET = 1;
     private static final int VAL_LEN_OFFSET = 5;
-    private static final int VEC_LEN_OFFSET = 9;
+    private static final int PTR_LEN_OFFSET = 9;
     private static final int HEIGHT_OFFSET = 13;
 
-    // 固定头部总大小 (1 + 4 + 4 + 4 + 4)
     public static final int HEADER_SIZE = 17;
 
     public static int allocateAndWriteNode(Arena arena, LogRecord record, int height) {
         byte[] key = record.getKey();
         byte[] value = record.getValue();
-        float[] vector = record.getVector();
+        byte[] pointer = record.getBlobPointer();
 
         int keyLen = key != null ? key.length : 0;
         int valLen = value != null ? value.length : 0;
-        // 物理事实：一个 float 在 Java 中绝对占用 4 个字节
-        int vecLen = (vector != null) ? vector.length * 4 : 0;
+        int ptrLen = pointer != null ? pointer.length : 0;
 
         // 1. 精确计算所需总物理内存
-        int totalSize = HEADER_SIZE + (height * 4) + keyLen + valLen + vecLen;
+        int totalSize = HEADER_SIZE + (height * 4) + keyLen + valLen + ptrLen;
 
         // 2. 向 Arena 申请无锁连续内存块，获得绝对物理基址
         int baseOffset = arena.allocate(totalSize);
@@ -43,7 +41,7 @@ public final class NodeAccessor {
         arena.putByte(baseOffset + TYPE_OFFSET, record.getType());
         arena.putInt(baseOffset + KEY_LEN_OFFSET, keyLen);
         arena.putInt(baseOffset + VAL_LEN_OFFSET, valLen);
-        arena.putInt(baseOffset + VEC_LEN_OFFSET, vecLen);
+        arena.putInt(baseOffset + PTR_LEN_OFFSET, ptrLen);
         arena.putInt(baseOffset + HEIGHT_OFFSET, height);
 
         // 4. 初始化所有 Next Pointers 为 0 (必须在写变长数据前完成)
@@ -66,11 +64,9 @@ public final class NodeAccessor {
             currentWriteCursor += valLen;
         }
 
-        if (vector != null) {
-            for (float v : vector) {
-                arena.putInt(currentWriteCursor, Float.floatToIntBits(v));
-                currentWriteCursor += 4;
-            }
+        if (ptrLen > 0) {
+            arena.putBytes(currentWriteCursor, pointer);
+            currentWriteCursor += ptrLen;
         }
 
         return baseOffset;
@@ -86,6 +82,10 @@ public final class NodeAccessor {
 
     public static int getValueLength(Arena arena, int baseOffset) {
         return arena.getInt(baseOffset + VAL_LEN_OFFSET);
+    }
+
+    public static int getPointerLength(Arena arena, int baseOffset) {
+        return arena.getInt(baseOffset + PTR_LEN_OFFSET);
     }
 
     public static int getHeight(Arena arena, int baseOffset) {
